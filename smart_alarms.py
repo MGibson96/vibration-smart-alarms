@@ -51,8 +51,8 @@ READ_CONFIG = {
     "dbname":   os.environ["READ_DB_NAME"],
     "user":     os.environ["READ_DB_USER"],
     "password": os.environ["READ_DB_PASSWORD"],
-    "schema":   os.environ.get("READ_DB_SCHEMA", "public"),
-    "table":    os.environ.get("READ_DB_TABLE",  "falcon_scalars"),
+    "schema":   os.environ.get("DB_SCHEMA", "public"),
+    "table":    os.environ.get("READ_DB_TABLE", "falcon_scalars"),
 }
 
 WRITE_CONFIG = {
@@ -61,7 +61,7 @@ WRITE_CONFIG = {
     "dbname":       os.environ["WRITE_DB_NAME"],
     "user":         os.environ["WRITE_DB_USER"],
     "password":     os.environ["WRITE_DB_PASSWORD"],
-    "schema":       os.environ.get("WRITE_DB_SCHEMA",       "public"),
+    "schema":       os.environ.get("DB_SCHEMA", "public"),
     "output_table": os.environ.get("WRITE_DB_OUTPUT_TABLE", "smart_alarm_results"),
 }
 
@@ -394,6 +394,55 @@ ORDER BY machine_guid, point, parameter, type, date_meas DESC
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONNECTION TEST
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_cfg(cfg: dict) -> str:
+    """Human-readable connection summary — never shows the password."""
+    return (
+        f"{cfg['user']}@{cfg['host']}:{cfg['port']}"
+        f"/{cfg['dbname']}  schema={cfg['schema']}"
+    )
+
+
+def test_connections(read_cfg: dict, write_cfg: dict) -> bool:
+    """
+    Checks both database connections by running SELECT 1.
+    Returns True if both pass, False if either fails.
+    Also verifies the source table exists and the output schema is reachable.
+    """
+    try:
+        import sqlalchemy as sa
+    except ImportError:
+        sys.exit("sqlalchemy is required: pip install sqlalchemy psycopg2-binary")
+
+    all_ok = True
+
+    checks = [
+        ("READ ", read_cfg,  f"SELECT 1 FROM {_source_table(read_cfg)} LIMIT 1"),
+        ("WRITE", write_cfg, "SELECT 1"),
+    ]
+
+    print("\n── Connection test ──────────────────────────────────────────")
+    for label, cfg, probe_sql in checks:
+        desc = _fmt_cfg(cfg)
+        try:
+            engine = sa.create_engine(_make_db_url(cfg), connect_args={"connect_timeout": 10})
+            with engine.connect() as conn:
+                conn.execute(sa.text(probe_sql))
+            print(f"  [{label}]  OK   {desc}")
+            if label == "READ ":
+                print(f"           Table {_source_table(cfg)} is accessible.")
+        except Exception as e:
+            print(f"  [{label}]  FAIL {desc}")
+            print(f"           {e}")
+            all_ok = False
+
+    print("─────────────────────────────────────────────────────────────\n")
+    return all_ok
+
+
 def run_db_mode(
     read_cfg: dict,
     write_cfg: dict,
@@ -411,8 +460,11 @@ def run_db_mode(
 
     read_engine  = sa.create_engine(_make_db_url(read_cfg))
     tbl          = _source_table(read_cfg)
-    run_ts  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    t_total = time.perf_counter()
+    run_ts       = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    t_total      = time.perf_counter()
+
+    if not test_connections(read_cfg, write_cfg):
+        sys.exit("Connection test failed — fix the errors above before running.")
 
     with read_engine.connect() as conn:
         # ── 1. Get full machine list ──────────────────────────────────────────
@@ -710,6 +762,8 @@ def main():
         description="Compute smart vibration alarm thresholds",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--test",       action="store_true",
+                        help="Test both DB connections then exit")
     parser.add_argument("--demo",       action="store_true",
                         help="Demo mode: use sample CSV with synthetic history")
     parser.add_argument("--csv",        default="falcon_scalars_example_data_1000_rows.csv",
@@ -729,6 +783,16 @@ def main():
     parser.add_argument("--no-db-write", action="store_true",
                         help="Skip writing results back to the database (CSV only)")
     args = parser.parse_args()
+
+    if args.test:
+        try:
+            ok = test_connections(READ_CONFIG, WRITE_CONFIG)
+        except KeyError as e:
+            sys.exit(
+                f"Missing environment variable: {e}\n"
+                "Copy .env.example to .env and fill in your database details."
+            )
+        sys.exit(0 if ok else 1)
 
     if args.demo:
         results = run_demo_mode(

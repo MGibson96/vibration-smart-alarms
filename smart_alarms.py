@@ -483,7 +483,7 @@ def run_db_mode(
     except ImportError:
         sys.exit("sqlalchemy is required: pip install sqlalchemy pymssql")
 
-    run_ts  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    run_ts  = datetime.now(tz=timezone.utc).replace(tzinfo=None)  # naive UTC for SQL Server DATETIME2
     t_total = time.perf_counter()
 
     if not test_connections(read_cfg, write_cfg):
@@ -637,7 +637,7 @@ def run_demo_mode(
     print(f"Client filter: '{client}'\n")
     random.seed(42)
     t_total = time.perf_counter()
-    run_ts  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    run_ts  = datetime.now(tz=timezone.utc).replace(tzinfo=None)
 
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -758,7 +758,12 @@ def write_csv(results: list[dict], path: str) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(results)
+        for row in results:
+            # Format datetime as string for CSV; DB writes use the native object
+            out = dict(row)
+            if isinstance(out.get("computed_at"), datetime):
+                out["computed_at"] = out["computed_at"].strftime("%Y-%m-%d %H:%M:%S UTC")
+            writer.writerow(out)
 
 
 def print_summary(results: list[dict]) -> None:

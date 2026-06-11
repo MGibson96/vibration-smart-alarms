@@ -104,8 +104,10 @@ def is_stable(monthly_values: list[float]) -> tuple[bool, float | None, float | 
         return True, 0.0, 1.0
 
     result     = _scipy_stats.linregress(range(n), monthly_values)
-    slope_norm = result.slope / mean_val
-    p_value    = result.pvalue
+    # scipy returns numpy float64 — cast to plain Python float so pymssql
+    # doesn't serialise them as the string "np.float64(...)" in SQL
+    slope_norm = float(result.slope) / mean_val
+    p_value    = float(result.pvalue)
 
     trending_up = (p_value < P_VALUE_ALPHA) and (slope_norm > SLOPE_THRESHOLD)
     return not trending_up, round(slope_norm, 5), round(p_value, 5)
@@ -569,49 +571,78 @@ def run_db_mode(
     return results
 
 
+WRITE_BATCH_SIZE = 500
+
+
+def _row_params(row: dict) -> dict:
+    return {
+        "client":              row.get("client") or "",
+        "machine_guid":        row.get("machine_guid") or "",
+        "point":               row.get("point") or "",
+        "parameter":           row.get("parameter") or "",
+        "type":                row.get("type") or "",
+        "area":                row.get("area"),
+        "machine":             row.get("machine"),
+        "component":           row.get("component"),
+        "bearing":             row.get("bearing"),
+        "unit":                row.get("unit"),
+        "test_point_name":     row.get("test_point_name"),
+        "iso_pre_alarm":       row.get("iso_pre_alarm"),
+        "iso_alarm":           row.get("iso_alarm"),
+        "iso_danger":          row.get("iso_danger"),
+        "baseline_avg":        row.get("baseline_avg"),
+        "smart_warning":       row.get("smart_warning"),
+        "smart_alarm":         row.get("smart_alarm"),
+        "stable":              1 if row.get("stable") else (0 if row.get("stable") is False else None),
+        "stability_note":      row.get("stability_note"),
+        "slope_per_month_pct": row.get("slope_per_month_pct"),
+        "trend_p_value":       row.get("trend_p_value"),
+        "months_of_data":      row.get("months_of_data"),
+        "total_readings":      row.get("total_readings"),
+        "computed_at":         row.get("computed_at"),
+    }
+
+
 def write_results_to_db(engine, write_cfg: dict, results: list[dict], t0: float) -> None:
-    """Creates the output table if needed, then merges all results."""
+    """Creates the output table if needed, then merges results in batches."""
     import sqlalchemy as sa
 
     schema       = write_cfg["schema"]
     output_table = write_cfg["output_table"]
+    total        = len(results)
 
-    print(f"[{_elapsed(t0)}]  Writing {len(results)} rows to [{schema}].[{output_table}]...")
+    print(f"[{_elapsed(t0)}]  Writing {total} rows to [{schema}].[{output_table}] "
+          f"in batches of {WRITE_BATCH_SIZE}...")
 
     create_sql = SQL_CREATE_OUTPUT_TABLE.format(schema=schema, output_table=output_table)
     merge_sql  = sa.text(SQL_MERGE.format(schema=schema, output_table=output_table))
 
+    # Create table once, outside the per-batch transactions
     with engine.begin() as conn:
         conn.execute(sa.text(create_sql))
-        for row in results:
-            conn.execute(merge_sql, {
-                "client":              row.get("client") or "",
-                "machine_guid":        row.get("machine_guid") or "",
-                "point":               row.get("point") or "",
-                "parameter":           row.get("parameter") or "",
-                "type":                row.get("type") or "",
-                "area":                row.get("area"),
-                "machine":             row.get("machine"),
-                "component":           row.get("component"),
-                "bearing":             row.get("bearing"),
-                "unit":                row.get("unit"),
-                "test_point_name":     row.get("test_point_name"),
-                "iso_pre_alarm":       row.get("iso_pre_alarm"),
-                "iso_alarm":           row.get("iso_alarm"),
-                "iso_danger":          row.get("iso_danger"),
-                "baseline_avg":        row.get("baseline_avg"),
-                "smart_warning":       row.get("smart_warning"),
-                "smart_alarm":         row.get("smart_alarm"),
-                "stable":              1 if row.get("stable") else (0 if row.get("stable") is False else None),
-                "stability_note":      row.get("stability_note"),
-                "slope_per_month_pct": row.get("slope_per_month_pct"),
-                "trend_p_value":       row.get("trend_p_value"),
-                "months_of_data":      row.get("months_of_data"),
-                "total_readings":      row.get("total_readings"),
-                "computed_at":         row.get("computed_at"),
-            })
 
-    print(f"[{_elapsed(t0)}]  Database write complete.")
+    batches     = [results[i: i + WRITE_BATCH_SIZE]
+                   for i in range(0, total, WRITE_BATCH_SIZE)]
+    n_batches   = len(batches)
+    batch_times: list[float] = []
+
+    for i, batch in enumerate(batches, start=1):
+        t_batch = time.perf_counter()
+        with engine.begin() as conn:
+            for row in batch:
+                conn.execute(merge_sql, _row_params(row))
+        elapsed_batch = time.perf_counter() - t_batch
+        batch_times.append(elapsed_batch)
+        remaining = (sum(batch_times) / len(batch_times)) * (n_batches - i)
+        pct       = i / n_batches * 100
+        rows_done = min(i * WRITE_BATCH_SIZE, total)
+        print(
+            f"[{_elapsed(t0)}]  Write batch {i:>{len(str(n_batches))}}/{n_batches} "
+            f"({pct:5.1f}%)  {rows_done}/{total} rows  "
+            f"{elapsed_batch:.1f}s/batch  ETA {_fmt_seconds(remaining)}"
+        )
+
+    print(f"[{_elapsed(t0)}]  Database write complete — {total} rows upserted.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

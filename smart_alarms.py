@@ -220,53 +220,62 @@ def _guid_list(guids: list[str]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SQL_MACHINES = """
-SELECT DISTINCT machine_guid, machine
+SELECT DISTINCT [Machine GUID] AS machine_guid, [Machine] AS machine
 FROM {table}
-WHERE client = :client
-  AND date_meas >= DATEADD(month, -{months}, GETUTCDATE())
-ORDER BY machine_guid
+WHERE [client] = :client
+  AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+ORDER BY [Machine GUID]
 """
 
 SQL_MONTHLY_BATCH = """
 SELECT
-    machine_guid,
-    point,
-    parameter,
-    type,
-    FORMAT(DATEADD(month, DATEDIFF(month, 0, date_meas), 0), 'yyyy-MM') AS month,
-    AVG(CAST(value AS FLOAT))  AS avg_value,
-    COUNT(*)                   AS reading_count
+    [Machine GUID]  AS machine_guid,
+    [Point]         AS point,
+    [Parameter]     AS parameter,
+    [Type]          AS type,
+    FORMAT(DATEADD(month, DATEDIFF(month, 0, [Date(meas)]), 0), 'yyyy-MM') AS month,
+    AVG([Value])    AS avg_value,
+    COUNT(*)        AS reading_count
 FROM {table}
 WHERE
-    client = :client
-    AND machine_guid IN ({guids})
-    AND date_meas >= DATEADD(month, -{months}, GETUTCDATE())
-    AND date_meas <  GETUTCDATE()
-    AND CAST(status_code AS INT) IN (2, 3, 4, 5)
-    AND value IS NOT NULL
-    AND CAST(value AS FLOAT) > 0
+    [client] = :client
+    AND [Machine GUID] IN ({guids})
+    AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+    AND [Date(meas)] <  GETUTCDATE()
+    AND [Status code] IN (2, 3, 4, 5)
+    AND [Value] IS NOT NULL
+    AND [Value] > 0
 GROUP BY
-    machine_guid, point, parameter, type,
-    DATEADD(month, DATEDIFF(month, 0, date_meas), 0)
-ORDER BY machine_guid, point, parameter, type, month
+    [Machine GUID], [Point], [Parameter], [Type],
+    DATEADD(month, DATEDIFF(month, 0, [Date(meas)]), 0)
+ORDER BY [Machine GUID], [Point], [Parameter], [Type], month
 """
 
 SQL_META_BATCH = """
 WITH ranked AS (
     SELECT
-        machine_guid, point, parameter, type, unit, client,
-        machine, component, bearing, test_point_name,
-        COALESCE(area_sub_1, '') AS area,
-        pal_plus, al_plus, dg_plus,
+        [Machine GUID]  AS machine_guid,
+        [Point]         AS point,
+        [Parameter]     AS parameter,
+        [Type]          AS type,
+        [Unit]          AS unit,
+        [client]        AS client,
+        [Machine]       AS machine,
+        [Component]     AS component,
+        [Bearing]       AS bearing,
+        [Parent]        AS area,
+        [pAL+]          AS pal_plus,
+        [AL+]           AS al_plus,
+        [DG+]           AS dg_plus,
         ROW_NUMBER() OVER (
-            PARTITION BY machine_guid, point, parameter, type
-            ORDER BY date_meas DESC
+            PARTITION BY [Machine GUID], [Point], [Parameter], [Type]
+            ORDER BY [Date(meas)] DESC
         ) AS rn
     FROM {table}
     WHERE
-        client = :client
-        AND machine_guid IN ({guids})
-        AND date_meas >= DATEADD(day, -30, GETUTCDATE())
+        [client] = :client
+        AND [Machine GUID] IN ({guids})
+        AND [Date(meas)] >= DATEADD(day, -30, GETUTCDATE())
 )
 SELECT * FROM ranked WHERE rn = 1
 """
@@ -524,12 +533,12 @@ def run_db_mode(
             key = (row.machine_guid, row.point, row.parameter, row.type)
             all_meta[key] = {
                 "client":          row.client,
-                "area":            row.area,
+                "area":            row.area,       # sourced from [Parent]
                 "machine":         row.machine,
                 "component":       row.component,
                 "bearing":         row.bearing,
                 "unit":            row.unit,
-                "test_point_name": row.test_point_name,
+                "test_point_name": "",             # not in dbt table
                 "pal_plus":        row.pal_plus,
                 "al_plus":         row.al_plus,
                 "dg_plus":         row.dg_plus,

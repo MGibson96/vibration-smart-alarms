@@ -277,7 +277,7 @@ WITH ranked AS (
     WHERE
         [client] = :client
         AND [Machine GUID] IN ({guids})
-        AND [Date(meas)] >= DATEADD(day, -30, GETUTCDATE())
+        AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
 )
 SELECT * FROM ranked WHERE rn = 1
 """
@@ -479,6 +479,8 @@ def run_db_mode(
     alarm_mult: float,
     batch_size: int,
     write_db: bool = True,
+    machine_guid: str | None = None,
+    limit_machines: int | None = None,
 ) -> list[dict]:
     try:
         import sqlalchemy as sa
@@ -503,6 +505,16 @@ def run_db_mode(
         ).fetchall()
 
     machine_guids  = [r.machine_guid for r in machine_rows]
+
+    # Pilot filters: single machine or hard cap
+    if machine_guid:
+        machine_guids = [g for g in machine_guids if g == machine_guid]
+        if not machine_guids:
+            sys.exit(f"Machine GUID '{machine_guid}' not found for client='{client}' "
+                     f"in the last {months} months.")
+    if limit_machines:
+        machine_guids = machine_guids[:limit_machines]
+
     total_machines = len(machine_guids)
     batches        = [machine_guids[i: i + batch_size]
                       for i in range(0, total_machines, batch_size)]
@@ -524,7 +536,7 @@ def run_db_mode(
             ), {"client": client}).fetchall()
 
             meta_rows = conn.execute(sa.text(
-                SQL_META_BATCH.format(table=tbl, guids=guid_str)
+                SQL_META_BATCH.format(table=tbl, guids=guid_str, months=months)
             ), {"client": client}).fetchall()
 
         for row in monthly_rows:
@@ -860,6 +872,10 @@ def main():
     parser.add_argument("--out",         default="smart_alarm_results.csv")
     parser.add_argument("--no-db-write", action="store_true",
                         help="Skip writing to the database (CSV output only)")
+    parser.add_argument("--machine",     default=None,
+                        help="Run for a single machine GUID only (pilot mode)")
+    parser.add_argument("--limit",       type=int, default=None,
+                        help="Cap the number of machines processed (e.g. --limit 1)")
     args = parser.parse_args()
 
     if args.test:
@@ -882,6 +898,8 @@ def main():
             READ_CONFIG, WRITE_CONFIG, args.client, args.months,
             args.warning, args.alarm, args.batch_size,
             write_db=not args.no_db_write,
+            machine_guid=args.machine,
+            limit_machines=args.limit,
         )
 
     print_summary(results)

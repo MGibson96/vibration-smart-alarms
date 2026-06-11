@@ -43,13 +43,14 @@ from scipy import stats as _scipy_stats
 # ═══════════════════════════════════════════════════════════════════════════════
 
 DB_CONFIG = {
-    "host":     os.environ.get("DB_HOST",     "localhost"),       # DB_HOST
-    "port":     int(os.environ.get("DB_PORT", "5432")),           # DB_PORT
-    "dbname":   os.environ.get("DB_NAME",     "your_database"),   # DB_NAME
-    "user":     os.environ.get("DB_USER",     "your_username"),   # DB_USER
-    "password": os.environ.get("DB_PASSWORD", "your_password"),   # DB_PASSWORD
-    "schema":   os.environ.get("DB_SCHEMA",   "public"),          # DB_SCHEMA
-    "table":    os.environ.get("DB_TABLE",    "falcon_scalars"),  # DB_TABLE
+    "host":         os.environ.get("DB_HOST",         "localhost"),         # DB_HOST
+    "port":         int(os.environ.get("DB_PORT",     "5432")),             # DB_PORT
+    "dbname":       os.environ.get("DB_NAME",         "your_database"),     # DB_NAME
+    "user":         os.environ.get("DB_USER",         "your_username"),     # DB_USER
+    "password":     os.environ.get("DB_PASSWORD",     "your_password"),     # DB_PASSWORD
+    "schema":       os.environ.get("DB_SCHEMA",       "public"),            # DB_SCHEMA
+    "table":        os.environ.get("DB_TABLE",        "falcon_scalars"),    # DB_TABLE  (source — read only)
+    "output_table": os.environ.get("DB_OUTPUT_TABLE", "smart_alarm_results"), # DB_OUTPUT_TABLE (written by this script)
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -183,6 +184,130 @@ def compute_smart_alarms(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  OUTPUT TABLE  — created automatically, never touches the source table
+# ─────────────────────────────────────────────────────────────────────────────
+
+SQL_CREATE_OUTPUT_TABLE = """
+CREATE TABLE IF NOT EXISTS {schema}.{output_table} (
+    -- identity / primary key
+    client              TEXT         NOT NULL,
+    machine_guid        TEXT         NOT NULL,
+    point               TEXT         NOT NULL,
+    parameter           TEXT         NOT NULL,
+    type                TEXT         NOT NULL,
+    -- metadata
+    area                TEXT,
+    machine             TEXT,
+    component           TEXT,
+    bearing             TEXT,
+    unit                TEXT,
+    test_point_name     TEXT,
+    -- existing ISO alarms (copied from source, never modified there)
+    iso_pre_alarm       NUMERIC,
+    iso_alarm           NUMERIC,
+    iso_danger          NUMERIC,
+    -- smart alarm thresholds
+    baseline_avg        NUMERIC,
+    smart_warning       NUMERIC,
+    smart_alarm         NUMERIC,
+    -- stability audit
+    stable              BOOLEAN,
+    stability_note      TEXT,
+    slope_per_month_pct NUMERIC,
+    trend_p_value       NUMERIC,
+    months_of_data      INTEGER,
+    total_readings      INTEGER,
+    computed_at         TIMESTAMPTZ,
+    PRIMARY KEY (client, machine_guid, point, parameter, type)
+);
+"""
+
+SQL_UPSERT_ROW = """
+INSERT INTO {schema}.{output_table} (
+    client, machine_guid, point, parameter, type,
+    area, machine, component, bearing, unit, test_point_name,
+    iso_pre_alarm, iso_alarm, iso_danger,
+    baseline_avg, smart_warning, smart_alarm,
+    stable, stability_note, slope_per_month_pct, trend_p_value,
+    months_of_data, total_readings, computed_at
+) VALUES (
+    :client, :machine_guid, :point, :parameter, :type,
+    :area, :machine, :component, :bearing, :unit, :test_point_name,
+    :iso_pre_alarm, :iso_alarm, :iso_danger,
+    :baseline_avg, :smart_warning, :smart_alarm,
+    :stable, :stability_note, :slope_per_month_pct, :trend_p_value,
+    :months_of_data, :total_readings, :computed_at
+)
+ON CONFLICT (client, machine_guid, point, parameter, type) DO UPDATE SET
+    area                = EXCLUDED.area,
+    machine             = EXCLUDED.machine,
+    component           = EXCLUDED.component,
+    bearing             = EXCLUDED.bearing,
+    unit                = EXCLUDED.unit,
+    test_point_name     = EXCLUDED.test_point_name,
+    iso_pre_alarm       = EXCLUDED.iso_pre_alarm,
+    iso_alarm           = EXCLUDED.iso_alarm,
+    iso_danger          = EXCLUDED.iso_danger,
+    baseline_avg        = EXCLUDED.baseline_avg,
+    smart_warning       = EXCLUDED.smart_warning,
+    smart_alarm         = EXCLUDED.smart_alarm,
+    stable              = EXCLUDED.stable,
+    stability_note      = EXCLUDED.stability_note,
+    slope_per_month_pct = EXCLUDED.slope_per_month_pct,
+    trend_p_value       = EXCLUDED.trend_p_value,
+    months_of_data      = EXCLUDED.months_of_data,
+    total_readings      = EXCLUDED.total_readings,
+    computed_at         = EXCLUDED.computed_at;
+"""
+
+
+def write_results_to_db(engine, cfg: dict, results: list[dict], t0: float) -> None:
+    """Creates the output table if needed, then upserts all results."""
+    import sqlalchemy as sa
+
+    schema       = cfg["schema"]
+    output_table = cfg["output_table"]
+
+    print(f"[{_elapsed(t0)}]  Writing {len(results)} rows to {schema}.{output_table}...")
+
+    with engine.begin() as conn:
+        conn.execute(sa.text(
+            SQL_CREATE_OUTPUT_TABLE.format(schema=schema, output_table=output_table)
+        ))
+
+        upsert = sa.text(SQL_UPSERT_ROW.format(schema=schema, output_table=output_table))
+        for row in results:
+            conn.execute(upsert, {
+                "client":              row.get("client") or "",
+                "machine_guid":        row.get("machine_guid") or "",
+                "point":               row.get("point") or "",
+                "parameter":           row.get("parameter") or "",
+                "type":                row.get("type") or "",
+                "area":                row.get("area"),
+                "machine":             row.get("machine"),
+                "component":           row.get("component"),
+                "bearing":             row.get("bearing"),
+                "unit":                row.get("unit"),
+                "test_point_name":     row.get("test_point_name"),
+                "iso_pre_alarm":       row.get("iso_pre_alarm"),
+                "iso_alarm":           row.get("iso_alarm"),
+                "iso_danger":          row.get("iso_danger"),
+                "baseline_avg":        row.get("baseline_avg"),
+                "smart_warning":       row.get("smart_warning"),
+                "smart_alarm":         row.get("smart_alarm"),
+                "stable":              row.get("stable"),
+                "stability_note":      row.get("stability_note"),
+                "slope_per_month_pct": row.get("slope_per_month_pct"),
+                "trend_p_value":       row.get("trend_p_value"),
+                "months_of_data":      row.get("months_of_data"),
+                "total_readings":      row.get("total_readings"),
+                "computed_at":         row.get("computed_at"),
+            })
+
+    print(f"[{_elapsed(t0)}]  Database write complete.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  DATABASE MODE
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -260,6 +385,7 @@ def run_db_mode(
     warning_mult: float,
     alarm_mult: float,
     batch_size: int,
+    write_db: bool = True,
 ) -> list[dict]:
     try:
         import sqlalchemy as sa
@@ -346,6 +472,12 @@ def run_db_mode(
     # ── 3. Compute smart alarms ───────────────────────────────────────────────
     print(f"\n[{_elapsed(t_total)}]  Computing smart alarm thresholds...")
     results = compute_smart_alarms(all_monthly, all_meta, warning_mult, alarm_mult, run_ts)
+
+    # ── 4. Write results back to the database ─────────────────────────────────
+    if write_db:
+        write_results_to_db(engine, cfg, results, t_total)
+    else:
+        print(f"[{_elapsed(t_total)}]  Skipping database write (--no-db-write).")
 
     print(f"[{_elapsed(t_total)}]  Done.  Total runtime: {_elapsed(t_total)}\n")
     return results
@@ -573,10 +705,12 @@ def main():
                         help="Warning threshold multiplier")
     parser.add_argument("--alarm",      type=float, default=DEFAULT_ALARM_MULT,
                         help="Alarm threshold multiplier")
-    parser.add_argument("--batch-size", type=int,   default=DEFAULT_BATCH_SIZE,
+    parser.add_argument("--batch-size",  type=int,  default=DEFAULT_BATCH_SIZE,
                         help="Machines per database query batch")
-    parser.add_argument("--out",        default="smart_alarm_results.csv",
+    parser.add_argument("--out",         default="smart_alarm_results.csv",
                         help="Output CSV path")
+    parser.add_argument("--no-db-write", action="store_true",
+                        help="Skip writing results back to the database (CSV only)")
     args = parser.parse_args()
 
     if args.demo:
@@ -588,6 +722,7 @@ def main():
         results = run_db_mode(
             DB_CONFIG, args.client, args.months,
             args.warning, args.alarm, args.batch_size,
+            write_db=not args.no_db_write,
         )
 
     print_summary(results)

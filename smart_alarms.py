@@ -35,22 +35,34 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+from dotenv import load_dotenv
 from scipy import stats as _scipy_stats
 
+# Load .env from the same directory as this script
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DATABASE CONFIG — fill in your details here
-#  You can also override any field via environment variable (shown in comments).
+#  DATABASE CONFIG  — edit .env, not this file
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DB_CONFIG = {
-    "host":         os.environ.get("DB_HOST",         "localhost"),         # DB_HOST
-    "port":         int(os.environ.get("DB_PORT",     "5432")),             # DB_PORT
-    "dbname":       os.environ.get("DB_NAME",         "your_database"),     # DB_NAME
-    "user":         os.environ.get("DB_USER",         "your_username"),     # DB_USER
-    "password":     os.environ.get("DB_PASSWORD",     "your_password"),     # DB_PASSWORD
-    "schema":       os.environ.get("DB_SCHEMA",       "public"),            # DB_SCHEMA
-    "table":        os.environ.get("DB_TABLE",        "falcon_scalars"),    # DB_TABLE  (source — read only)
-    "output_table": os.environ.get("DB_OUTPUT_TABLE", "smart_alarm_results"), # DB_OUTPUT_TABLE (written by this script)
+READ_CONFIG = {
+    "host":     os.environ["READ_DB_HOST"],
+    "port":     int(os.environ.get("READ_DB_PORT", "5432")),
+    "dbname":   os.environ["READ_DB_NAME"],
+    "user":     os.environ["READ_DB_USER"],
+    "password": os.environ["READ_DB_PASSWORD"],
+    "schema":   os.environ.get("READ_DB_SCHEMA", "public"),
+    "table":    os.environ.get("READ_DB_TABLE",  "falcon_scalars"),
+}
+
+WRITE_CONFIG = {
+    "host":         os.environ["WRITE_DB_HOST"],
+    "port":         int(os.environ.get("WRITE_DB_PORT", "5432")),
+    "dbname":       os.environ["WRITE_DB_NAME"],
+    "user":         os.environ["WRITE_DB_USER"],
+    "password":     os.environ["WRITE_DB_PASSWORD"],
+    "schema":       os.environ.get("WRITE_DB_SCHEMA",       "public"),
+    "output_table": os.environ.get("WRITE_DB_OUTPUT_TABLE", "smart_alarm_results"),
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -261,12 +273,12 @@ ON CONFLICT (client, machine_guid, point, parameter, type) DO UPDATE SET
 """
 
 
-def write_results_to_db(engine, cfg: dict, results: list[dict], t0: float) -> None:
+def write_results_to_db(engine, write_cfg: dict, results: list[dict], t0: float) -> None:
     """Creates the output table if needed, then upserts all results."""
     import sqlalchemy as sa
 
-    schema       = cfg["schema"]
-    output_table = cfg["output_table"]
+    schema       = write_cfg["schema"]
+    output_table = write_cfg["output_table"]
 
     print(f"[{_elapsed(t0)}]  Writing {len(results)} rows to {schema}.{output_table}...")
 
@@ -318,8 +330,12 @@ def _make_db_url(cfg: dict) -> str:
     )
 
 
-def _table(cfg: dict) -> str:
+def _source_table(cfg: dict) -> str:
     return f"{cfg['schema']}.{cfg['table']}"
+
+
+def _output_table(cfg: dict) -> str:
+    return f"{cfg['schema']}.{cfg['output_table']}"
 
 
 SQL_MACHINES = """
@@ -379,7 +395,8 @@ ORDER BY machine_guid, point, parameter, type, date_meas DESC
 
 
 def run_db_mode(
-    cfg: dict,
+    read_cfg: dict,
+    write_cfg: dict,
     client: str,
     months: int,
     warning_mult: float,
@@ -392,13 +409,12 @@ def run_db_mode(
     except ImportError:
         sys.exit("sqlalchemy is required: pip install sqlalchemy psycopg2-binary")
 
-    db_url  = _make_db_url(cfg)
-    tbl     = _table(cfg)
-    engine  = sa.create_engine(db_url)
+    read_engine  = sa.create_engine(_make_db_url(read_cfg))
+    tbl          = _source_table(read_cfg)
     run_ts  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     t_total = time.perf_counter()
 
-    with engine.connect() as conn:
+    with read_engine.connect() as conn:
         # ── 1. Get full machine list ──────────────────────────────────────────
         print(f"[{_elapsed(t_total)}]  Fetching machine list for client='{client}'...")
         machine_rows = conn.execute(
@@ -424,7 +440,7 @@ def run_db_mode(
         t_batch = time.perf_counter()
         guid_tuple = tuple(batch)
 
-        with engine.connect() as conn:
+        with read_engine.connect() as conn:
             monthly_rows = conn.execute(
                 sa.text(SQL_MONTHLY_BATCH.format(table=tbl, months=months)).bindparams(
                     sa.bindparam("guids", expanding=True)
@@ -475,7 +491,8 @@ def run_db_mode(
 
     # ── 4. Write results back to the database ─────────────────────────────────
     if write_db:
-        write_results_to_db(engine, cfg, results, t_total)
+        write_engine = sa.create_engine(_make_db_url(write_cfg))
+        write_results_to_db(write_engine, write_cfg, results, t_total)
     else:
         print(f"[{_elapsed(t_total)}]  Skipping database write (--no-db-write).")
 
@@ -719,8 +736,16 @@ def main():
             args.warning, args.alarm, args.batch_size,
         )
     else:
+        try:
+            read_cfg  = READ_CONFIG
+            write_cfg = WRITE_CONFIG
+        except KeyError as e:
+            sys.exit(
+                f"Missing environment variable: {e}\n"
+                "Copy .env.example to .env and fill in your database details."
+            )
         results = run_db_mode(
-            DB_CONFIG, args.client, args.months,
+            read_cfg, write_cfg, args.client, args.months,
             args.warning, args.alarm, args.batch_size,
             write_db=not args.no_db_write,
         )

@@ -222,7 +222,7 @@ def _guid_list(guids: list[str]) -> str:
 SQL_MACHINES = """
 SELECT DISTINCT machine_guid, machine
 FROM {table}
-WHERE client = %(client)s
+WHERE client = :client
   AND date_meas >= DATEADD(month, -{months}, GETUTCDATE())
 ORDER BY machine_guid
 """
@@ -238,7 +238,7 @@ SELECT
     COUNT(*)                   AS reading_count
 FROM {table}
 WHERE
-    client = %(client)s
+    client = :client
     AND machine_guid IN ({guids})
     AND date_meas >= DATEADD(month, -{months}, GETUTCDATE())
     AND date_meas <  GETUTCDATE()
@@ -264,7 +264,7 @@ WITH ranked AS (
         ) AS rn
     FROM {table}
     WHERE
-        client = %(client)s
+        client = :client
         AND machine_guid IN ({guids})
         AND date_meas >= DATEADD(day, -30, GETUTCDATE())
 )
@@ -309,30 +309,30 @@ CREATE TABLE [{schema}].[{output_table}] (
 SQL_MERGE = """
 MERGE [{schema}].[{output_table}] WITH (HOLDLOCK) AS target
 USING (SELECT
-    %(client)s              AS client,
-    %(machine_guid)s        AS machine_guid,
-    %(point)s               AS point,
-    %(parameter)s           AS parameter,
-    %(type)s                AS type,
-    %(area)s                AS area,
-    %(machine)s             AS machine,
-    %(component)s           AS component,
-    %(bearing)s             AS bearing,
-    %(unit)s                AS unit,
-    %(test_point_name)s     AS test_point_name,
-    %(iso_pre_alarm)s       AS iso_pre_alarm,
-    %(iso_alarm)s           AS iso_alarm,
-    %(iso_danger)s          AS iso_danger,
-    %(baseline_avg)s        AS baseline_avg,
-    %(smart_warning)s       AS smart_warning,
-    %(smart_alarm)s         AS smart_alarm,
-    %(stable)s              AS stable,
-    %(stability_note)s      AS stability_note,
-    %(slope_per_month_pct)s AS slope_per_month_pct,
-    %(trend_p_value)s       AS trend_p_value,
-    %(months_of_data)s      AS months_of_data,
-    %(total_readings)s      AS total_readings,
-    %(computed_at)s         AS computed_at
+    :client              AS client,
+    :machine_guid        AS machine_guid,
+    :point               AS point,
+    :parameter           AS parameter,
+    :type                AS type,
+    :area                AS area,
+    :machine             AS machine,
+    :component           AS component,
+    :bearing             AS bearing,
+    :unit                AS unit,
+    :test_point_name     AS test_point_name,
+    :iso_pre_alarm       AS iso_pre_alarm,
+    :iso_alarm           AS iso_alarm,
+    :iso_danger          AS iso_danger,
+    :baseline_avg        AS baseline_avg,
+    :smart_warning       AS smart_warning,
+    :smart_alarm         AS smart_alarm,
+    :stable              AS stable,
+    :stability_note      AS stability_note,
+    :slope_per_month_pct AS slope_per_month_pct,
+    :trend_p_value       AS trend_p_value,
+    :months_of_data      AS months_of_data,
+    :total_readings      AS total_readings,
+    :computed_at         AS computed_at
 ) AS source
 ON  target.client       = source.client
 AND target.machine_guid = source.machine_guid

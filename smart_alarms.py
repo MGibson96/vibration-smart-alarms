@@ -390,6 +390,31 @@ def _fmt_cfg(cfg: dict) -> str:
     )
 
 
+def show_columns(read_cfg: dict) -> None:
+    """Prints every column name and type in the source table."""
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(_make_db_url(read_cfg))
+    sql = sa.text("""
+        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = :schema
+          AND TABLE_NAME   = :table
+        ORDER BY ORDINAL_POSITION
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {
+            "schema": read_cfg["schema"],
+            "table":  read_cfg["table"],
+        }).fetchall()
+
+    print(f"\nColumns in [{read_cfg['schema']}].[{read_cfg['table']}]  "
+          f"({len(rows)} total)\n")
+    for i, r in enumerate(rows, 1):
+        print(f"  {i:3d}.  {r.COLUMN_NAME:<35s}  {r.DATA_TYPE:<20s}  nullable={r.IS_NULLABLE}")
+    print()
+
+
 def test_connections(read_cfg: dict, write_cfg: dict) -> bool:
     """
     Tests both connections with a lightweight query.
@@ -774,8 +799,10 @@ def main():
         description="Compute smart vibration alarm thresholds (SQL Server)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--test",        action="store_true",
+    parser.add_argument("--test",         action="store_true",
                         help="Test DB connections then exit")
+    parser.add_argument("--show-columns", action="store_true",
+                        help="Print all column names in the source table then exit")
     parser.add_argument("--demo",        action="store_true",
                         help="Demo mode: sample CSV with synthetic history, no DB needed")
     parser.add_argument("--csv",         default="falcon_scalars_example_data_1000_rows.csv",
@@ -793,6 +820,10 @@ def main():
     if args.test:
         ok = test_connections(READ_CONFIG, WRITE_CONFIG)
         sys.exit(0 if ok else 1)
+
+    if args.show_columns:
+        show_columns(READ_CONFIG)
+        sys.exit(0)
 
     if args.demo:
         results = run_demo_mode(

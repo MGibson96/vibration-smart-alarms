@@ -226,6 +226,7 @@ SELECT DISTINCT [Machine GUID] AS machine_guid, [Machine] AS machine
 FROM {table}
 WHERE [client] = :client
   AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+  {area_filter}
 ORDER BY [Machine GUID]
 """
 
@@ -481,6 +482,7 @@ def run_db_mode(
     write_db: bool = True,
     machine_guid: str | None = None,
     limit_machines: int | None = None,
+    area: str | None = None,
 ) -> list[dict]:
     try:
         import sqlalchemy as sa
@@ -497,11 +499,16 @@ def run_db_mode(
     tbl         = _source_table(read_cfg)
 
     # ── 1. Fetch machine list ─────────────────────────────────────────────────
-    print(f"[{_elapsed(t_total)}]  Fetching machine list for client='{client}'...")
+    area_desc = f"  area='{area}'" if area else ""
+    print(f"[{_elapsed(t_total)}]  Fetching machine list for client='{client}'{area_desc}...")
+    area_filter = "AND [Parent] = :area" if area else ""
+    params: dict = {"client": client}
+    if area:
+        params["area"] = area
     with read_engine.connect() as conn:
         machine_rows = conn.execute(
-            sa.text(SQL_MACHINES.format(table=tbl, months=months)),
-            {"client": client},
+            sa.text(SQL_MACHINES.format(table=tbl, months=months, area_filter=area_filter)),
+            params,
         ).fetchall()
 
     machine_guids  = [r.machine_guid for r in machine_rows]
@@ -876,6 +883,8 @@ def main():
                         help="Run for a single machine GUID only (pilot mode)")
     parser.add_argument("--limit",       type=int, default=None,
                         help="Cap the number of machines processed (e.g. --limit 1)")
+    parser.add_argument("--area",        default=None,
+                        help="Filter by Parent area (e.g. 'Calpan/Building 12/Level 2/Step 34')")
     args = parser.parse_args()
 
     if args.test:
@@ -900,6 +909,7 @@ def main():
             write_db=not args.no_db_write,
             machine_guid=args.machine,
             limit_machines=args.limit,
+            area=args.area,
         )
 
     print_summary(results)

@@ -3,10 +3,12 @@
 Smart Vibration Alarms
 ======================
 Calculates data-driven alarm thresholds from a rolling baseline and writes a
-combined CSV that sits alongside the existing ISO alarm levels — the source
+combined table that sits alongside the existing ISO alarm levels — the source
 table is never modified.
 
-Output CSV columns
+Database: Microsoft SQL Server (T-SQL)
+
+Output table columns
   Metadata  : client, area, machine, component, bearing, point, parameter,
                type, unit, test_point_name
   ISO alarms: iso_pre_alarm, iso_alarm, iso_danger  (existing limits, unchanged)
@@ -15,10 +17,13 @@ Output CSV columns
                months_of_data, total_readings, computed_at
 
 Usage
-  # Demo (synthetic history built from the sample CSV):
+  # Test connections only:
+  python3 smart_alarms.py --test
+
+  # Demo (synthetic history from sample CSV, no DB needed):
   python3 smart_alarms.py --demo
 
-  # Live database (edit DB_CONFIG below first):
+  # Live database:
   python3 smart_alarms.py --client DSM
 
   # All options:
@@ -35,21 +40,34 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
+from dotenv import load_dotenv
 from scipy import stats as _scipy_stats
 
+# Load .env from the same directory as this script
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  DATABASE CONFIG — fill in your details here
-#  You can also override any field via environment variable (shown in comments).
+#  DATABASE CONFIG  — edit .env, not this file
 # ═══════════════════════════════════════════════════════════════════════════════
 
-DB_CONFIG = {
-    "host":     os.environ.get("DB_HOST",     "localhost"),       # DB_HOST
-    "port":     int(os.environ.get("DB_PORT", "5432")),           # DB_PORT
-    "dbname":   os.environ.get("DB_NAME",     "your_database"),   # DB_NAME
-    "user":     os.environ.get("DB_USER",     "your_username"),   # DB_USER
-    "password": os.environ.get("DB_PASSWORD", "your_password"),   # DB_PASSWORD
-    "schema":   os.environ.get("DB_SCHEMA",   "public"),          # DB_SCHEMA
-    "table":    os.environ.get("DB_TABLE",    "falcon_scalars"),  # DB_TABLE
+READ_CONFIG = {
+    "host":     os.environ.get("READ_DB_HOST", ""),
+    "port":     int(os.environ.get("READ_DB_PORT", "1433")),
+    "dbname":   os.environ.get("READ_DB_NAME", ""),
+    "user":     os.environ.get("READ_DB_USER", ""),
+    "password": os.environ.get("READ_DB_PASSWORD", ""),
+    "schema":   os.environ.get("DB_SCHEMA", "dbo"),
+    "table":    os.environ.get("READ_DB_TABLE", "falcon_scalars"),
+}
+
+WRITE_CONFIG = {
+    "host":         os.environ.get("WRITE_DB_HOST", ""),
+    "port":         int(os.environ.get("WRITE_DB_PORT", "1433")),
+    "dbname":       os.environ.get("WRITE_DB_NAME", ""),
+    "user":         os.environ.get("WRITE_DB_USER", ""),
+    "password":     os.environ.get("WRITE_DB_PASSWORD", ""),
+    "schema":       os.environ.get("DB_SCHEMA", "dbo"),
+    "output_table": os.environ.get("WRITE_DB_OUTPUT_TABLE", "smart_alarm_results"),
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -60,11 +78,11 @@ DEFAULT_CLIENT       = "DSM"
 DEFAULT_MONTHS       = 6
 DEFAULT_WARNING_MULT = 1.3
 DEFAULT_ALARM_MULT   = 1.5
-DEFAULT_BATCH_SIZE   = 50    # number of machines processed per database query
+DEFAULT_BATCH_SIZE   = 50
 
-MIN_MONTHS_REQUIRED  = 3     # points with fewer months are skipped
-SLOPE_THRESHOLD      = 0.05  # normalised slope > 5 %/month → unstable
-P_VALUE_ALPHA        = 0.10  # significance level for trend test
+MIN_MONTHS_REQUIRED  = 3
+SLOPE_THRESHOLD      = 0.05   # normalised slope > 5 %/month → unstable
+P_VALUE_ALPHA        = 0.10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,8 +92,8 @@ P_VALUE_ALPHA        = 0.10  # significance level for trend test
 def is_stable(monthly_values: list[float]) -> tuple[bool, float | None, float | None]:
     """
     Returns (stable, slope_normalised, p_value).
-    Both the slope threshold AND statistical significance must be exceeded to
-    flag a point as unstable — one alone is not sufficient.
+    Both the slope threshold AND statistical significance must be exceeded
+    to flag a point as unstable — one alone is not sufficient.
     """
     n = len(monthly_values)
     if n < 2:
@@ -86,8 +104,10 @@ def is_stable(monthly_values: list[float]) -> tuple[bool, float | None, float | 
         return True, 0.0, 1.0
 
     result     = _scipy_stats.linregress(range(n), monthly_values)
-    slope_norm = result.slope / mean_val
-    p_value    = result.pvalue
+    # scipy returns numpy float64 — cast to plain Python float so pymssql
+    # doesn't serialise them as the string "np.float64(...)" in SQL
+    slope_norm = float(result.slope) / mean_val
+    p_value    = float(result.pvalue)
 
     trending_up = (p_value < P_VALUE_ALPHA) and (slope_norm > SLOPE_THRESHOLD)
     return not trending_up, round(slope_norm, 5), round(p_value, 5)
@@ -104,23 +124,16 @@ def compute_smart_alarms(
     alarm_mult: float,
     computed_at: str,
 ) -> list[dict]:
-    """
-    monthly_data : {(machine_guid, point, parameter, type):
-                     [(month_str, avg_value, n_readings), ...]}
-    latest_meta  : {same key: metadata dict}
-    Returns list of result dicts, one per measurement point.
-    """
     results = []
 
     for key, months_list in monthly_data.items():
-        months_list  = sorted(months_list, key=lambda r: r[0])
-        values       = [r[1] for r in months_list]
-        n_months     = len(values)
-        total_reads  = sum(r[2] for r in months_list)
-        meta         = latest_meta.get(key, {})
+        months_list = sorted(months_list, key=lambda r: r[0])
+        values      = [r[1] for r in months_list]
+        n_months    = len(values)
+        total_reads = sum(r[2] for r in months_list)
+        meta        = latest_meta.get(key, {})
 
         row = {
-            # ── metadata ──────────────────────────────────────────────────────
             "client":          meta.get("client", ""),
             "area":            meta.get("area", ""),
             "machine_guid":    key[0],
@@ -132,15 +145,12 @@ def compute_smart_alarms(
             "type":            key[3],
             "unit":            meta.get("unit", ""),
             "test_point_name": meta.get("test_point_name", ""),
-            # ── existing ISO alarms (untouched) ───────────────────────────────
             "iso_pre_alarm":   meta.get("pal_plus"),
             "iso_alarm":       meta.get("al_plus"),
             "iso_danger":      meta.get("dg_plus"),
-            # ── smart alarm outputs ───────────────────────────────────────────
             "baseline_avg":        None,
             "smart_warning":       None,
             "smart_alarm":         None,
-            # ── stability audit ───────────────────────────────────────────────
             "stable":              None,
             "stability_note":      "",
             "slope_per_month_pct": None,
@@ -183,135 +193,358 @@ def compute_smart_alarms(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DATABASE MODE
+#  SQL SERVER HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _make_db_url(cfg: dict) -> str:
+    """mssql+pymssql connection URL."""
     return (
-        f"postgresql+psycopg2://{cfg['user']}:{cfg['password']}"
+        f"mssql+pymssql://{cfg['user']}:{cfg['password']}"
         f"@{cfg['host']}:{cfg['port']}/{cfg['dbname']}"
     )
 
 
-def _table(cfg: dict) -> str:
-    return f"{cfg['schema']}.{cfg['table']}"
+def _source_table(cfg: dict) -> str:
+    return f"[{cfg['schema']}].[{cfg['table']}]"
 
+
+def _output_table_name(cfg: dict) -> str:
+    return f"[{cfg['schema']}].[{cfg['output_table']}]"
+
+
+def _guid_list(guids: list[str]) -> str:
+    """Format a list of GUIDs for SQL IN clause (UUIDs are safe to inline)."""
+    return ", ".join(f"'{g}'" for g in guids)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  T-SQL QUERIES  (SQL Server syntax)
+# ─────────────────────────────────────────────────────────────────────────────
 
 SQL_MACHINES = """
-SELECT DISTINCT machine_guid, machine
+SELECT DISTINCT [Machine GUID] AS machine_guid, [Machine] AS machine
 FROM {table}
-WHERE client = :client
-  AND date_meas >= NOW() - INTERVAL '{months} months'
-ORDER BY machine_guid
+WHERE [client] = :client
+  AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+  {area_filter}
+ORDER BY [Machine GUID]
 """
 
 SQL_MONTHLY_BATCH = """
 SELECT
-    machine_guid,
-    point,
-    parameter,
-    type,
-    TO_CHAR(DATE_TRUNC('month', date_meas), 'YYYY-MM') AS month,
-    AVG(value::float)  AS avg_value,
-    COUNT(*)           AS reading_count
+    [Machine GUID]  AS machine_guid,
+    [Point]         AS point,
+    [Parameter]     AS parameter,
+    [Type]          AS type,
+    FORMAT(DATEADD(month, DATEDIFF(month, 0, [Date(meas)]), 0), 'yyyy-MM') AS month,
+    AVG([Value])    AS avg_value,
+    COUNT(*)        AS reading_count
 FROM {table}
 WHERE
-    client       = :client
-    AND machine_guid IN :guids
-    AND date_meas    >= NOW() - INTERVAL '{months} months'
-    AND date_meas    <  NOW()
-    AND status_code::int IN (2, 3, 4, 5)
-    AND value IS NOT NULL
-    AND value::float > 0
-GROUP BY machine_guid, point, parameter, type,
-         DATE_TRUNC('month', date_meas)
-ORDER BY machine_guid, point, parameter, type, month
+    [client] = :client
+    AND [Machine GUID] IN ({guids})
+    AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+    AND [Date(meas)] <  GETUTCDATE()
+    AND [Status code] IN (2, 3, 4, 5)
+    AND [Value] IS NOT NULL
+    AND [Value] > 0
+GROUP BY
+    [Machine GUID], [Point], [Parameter], [Type],
+    DATEADD(month, DATEDIFF(month, 0, [Date(meas)]), 0)
+ORDER BY [Machine GUID], [Point], [Parameter], [Type], month
 """
 
 SQL_META_BATCH = """
-SELECT DISTINCT ON (machine_guid, point, parameter, type)
-    machine_guid,
-    point,
-    parameter,
-    type,
-    unit,
-    client,
-    machine,
-    component,
-    bearing,
-    test_point_name,
-    COALESCE(area_sub_1, '') AS area,
-    pal_plus,
-    al_plus,
-    dg_plus
-FROM {table}
-WHERE
-    client       = :client
-    AND machine_guid IN :guids
-    AND date_meas >= NOW() - INTERVAL '30 days'
-ORDER BY machine_guid, point, parameter, type, date_meas DESC
+WITH ranked AS (
+    SELECT
+        [Machine GUID]  AS machine_guid,
+        [Point]         AS point,
+        [Parameter]     AS parameter,
+        [Type]          AS type,
+        [Unit]          AS unit,
+        [client]        AS client,
+        [Machine]       AS machine,
+        [Component]     AS component,
+        [Bearing]       AS bearing,
+        [Parent]        AS area,
+        [pAL+]          AS pal_plus,
+        [AL+]           AS al_plus,
+        [DG+]           AS dg_plus,
+        ROW_NUMBER() OVER (
+            PARTITION BY [Machine GUID], [Point], [Parameter], [Type]
+            ORDER BY [Date(meas)] DESC
+        ) AS rn
+    FROM {table}
+    WHERE
+        [client] = :client
+        AND [Machine GUID] IN ({guids})
+        AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+)
+SELECT * FROM ranked WHERE rn = 1
+"""
+
+SQL_CREATE_OUTPUT_TABLE = """
+IF NOT EXISTS (
+    SELECT 1 FROM INFORMATION_SCHEMA.TABLES
+    WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{output_table}'
+)
+CREATE TABLE [{schema}].[{output_table}] (
+    client              NVARCHAR(255)  NOT NULL,
+    machine_guid        NVARCHAR(255)  NOT NULL,
+    point               NVARCHAR(255)  NOT NULL,
+    parameter           NVARCHAR(255)  NOT NULL,
+    type                NVARCHAR(255)  NOT NULL,
+    area                NVARCHAR(500),
+    machine             NVARCHAR(255),
+    component           NVARCHAR(255),
+    bearing             NVARCHAR(255),
+    unit                NVARCHAR(50),
+    test_point_name     NVARCHAR(500),
+    iso_pre_alarm       FLOAT,
+    iso_alarm           FLOAT,
+    iso_danger          FLOAT,
+    baseline_avg        FLOAT,
+    smart_warning       FLOAT,
+    smart_alarm         FLOAT,
+    stable              BIT,
+    stability_note      NVARCHAR(MAX),
+    slope_per_month_pct FLOAT,
+    trend_p_value       FLOAT,
+    months_of_data      INT,
+    total_readings      INT,
+    computed_at         DATETIME2,
+    CONSTRAINT PK_smart_alarm_results
+        PRIMARY KEY (client, machine_guid, point, parameter, type)
+)
+"""
+
+SQL_MERGE = """
+MERGE [{schema}].[{output_table}] WITH (HOLDLOCK) AS target
+USING (SELECT
+    :client              AS client,
+    :machine_guid        AS machine_guid,
+    :point               AS point,
+    :parameter           AS parameter,
+    :type                AS type,
+    :area                AS area,
+    :machine             AS machine,
+    :component           AS component,
+    :bearing             AS bearing,
+    :unit                AS unit,
+    :test_point_name     AS test_point_name,
+    :iso_pre_alarm       AS iso_pre_alarm,
+    :iso_alarm           AS iso_alarm,
+    :iso_danger          AS iso_danger,
+    :baseline_avg        AS baseline_avg,
+    :smart_warning       AS smart_warning,
+    :smart_alarm         AS smart_alarm,
+    :stable              AS stable,
+    :stability_note      AS stability_note,
+    :slope_per_month_pct AS slope_per_month_pct,
+    :trend_p_value       AS trend_p_value,
+    :months_of_data      AS months_of_data,
+    :total_readings      AS total_readings,
+    :computed_at         AS computed_at
+) AS source
+ON  target.client       = source.client
+AND target.machine_guid = source.machine_guid
+AND target.point        = source.point
+AND target.parameter    = source.parameter
+AND target.type         = source.type
+WHEN MATCHED THEN UPDATE SET
+    area                = source.area,
+    machine             = source.machine,
+    component           = source.component,
+    bearing             = source.bearing,
+    unit                = source.unit,
+    test_point_name     = source.test_point_name,
+    iso_pre_alarm       = source.iso_pre_alarm,
+    iso_alarm           = source.iso_alarm,
+    iso_danger          = source.iso_danger,
+    baseline_avg        = source.baseline_avg,
+    smart_warning       = source.smart_warning,
+    smart_alarm         = source.smart_alarm,
+    stable              = source.stable,
+    stability_note      = source.stability_note,
+    slope_per_month_pct = source.slope_per_month_pct,
+    trend_p_value       = source.trend_p_value,
+    months_of_data      = source.months_of_data,
+    total_readings      = source.total_readings,
+    computed_at         = source.computed_at
+WHEN NOT MATCHED THEN INSERT (
+    client, machine_guid, point, parameter, type,
+    area, machine, component, bearing, unit, test_point_name,
+    iso_pre_alarm, iso_alarm, iso_danger,
+    baseline_avg, smart_warning, smart_alarm,
+    stable, stability_note, slope_per_month_pct, trend_p_value,
+    months_of_data, total_readings, computed_at
+) VALUES (
+    source.client, source.machine_guid, source.point, source.parameter, source.type,
+    source.area, source.machine, source.component, source.bearing, source.unit,
+    source.test_point_name, source.iso_pre_alarm, source.iso_alarm, source.iso_danger,
+    source.baseline_avg, source.smart_warning, source.smart_alarm,
+    source.stable, source.stability_note, source.slope_per_month_pct, source.trend_p_value,
+    source.months_of_data, source.total_readings, source.computed_at
+);
 """
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  CONNECTION TEST
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_cfg(cfg: dict) -> str:
+    """Human-readable connection summary — never shows the password."""
+    tbl = cfg.get("table") or cfg.get("output_table", "")
+    return (
+        f"{cfg['user']}@{cfg['host']}:{cfg['port']}"
+        f"/{cfg['dbname']}  schema={cfg['schema']}  table={tbl}"
+    )
+
+
+def show_columns(read_cfg: dict) -> None:
+    """Prints every column name and type in the source table."""
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(_make_db_url(read_cfg))
+    sql = sa.text("""
+        SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = :schema
+          AND TABLE_NAME   = :table
+        ORDER BY ORDINAL_POSITION
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {
+            "schema": read_cfg["schema"],
+            "table":  read_cfg["table"],
+        }).fetchall()
+
+    print(f"\nColumns in [{read_cfg['schema']}].[{read_cfg['table']}]  "
+          f"({len(rows)} total)\n")
+    for i, r in enumerate(rows, 1):
+        print(f"  {i:3d}.  {r.COLUMN_NAME:<35s}  {r.DATA_TYPE:<20s}  nullable={r.IS_NULLABLE}")
+    print()
+
+
+def test_connections(read_cfg: dict, write_cfg: dict) -> bool:
+    """
+    Tests both connections with a lightweight query.
+    READ  — verifies the source table is reachable.
+    WRITE — verifies the write user can connect (table created on first run).
+    Returns True if both pass.
+    """
+    try:
+        import sqlalchemy as sa
+    except ImportError:
+        sys.exit("sqlalchemy is required: pip install sqlalchemy pymssql")
+
+    all_ok = True
+    checks = [
+        ("READ ", read_cfg,  f"SELECT TOP 1 1 FROM {_source_table(read_cfg)}"),
+        ("WRITE", write_cfg, "SELECT 1"),
+    ]
+
+    print("\n── Connection test ──────────────────────────────────────────")
+    for label, cfg, probe_sql in checks:
+        if not cfg.get("host"):
+            print(f"  [{label}]  SKIP  (no host set in .env)")
+            all_ok = False
+            continue
+        desc = _fmt_cfg(cfg)
+        try:
+            engine = sa.create_engine(_make_db_url(cfg))
+            with engine.connect() as conn:
+                conn.execute(sa.text(probe_sql))
+            print(f"  [{label}]  OK    {desc}")
+        except Exception as e:
+            print(f"  [{label}]  FAIL  {desc}")
+            # Print just the first line of the error to keep output readable
+            print(f"           {str(e).splitlines()[0]}")
+            all_ok = False
+
+    print("─────────────────────────────────────────────────────────────\n")
+    return all_ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DATABASE MODE
+# ─────────────────────────────────────────────────────────────────────────────
+
 def run_db_mode(
-    cfg: dict,
+    read_cfg: dict,
+    write_cfg: dict,
     client: str,
     months: int,
     warning_mult: float,
     alarm_mult: float,
     batch_size: int,
+    write_db: bool = True,
+    machine_guid: str | None = None,
+    limit_machines: int | None = None,
+    area: str | None = None,
 ) -> list[dict]:
     try:
         import sqlalchemy as sa
     except ImportError:
-        sys.exit("sqlalchemy is required: pip install sqlalchemy psycopg2-binary")
+        sys.exit("sqlalchemy is required: pip install sqlalchemy pymssql")
 
-    db_url  = _make_db_url(cfg)
-    tbl     = _table(cfg)
-    engine  = sa.create_engine(db_url)
-    run_ts  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    run_ts  = datetime.now(tz=timezone.utc).replace(tzinfo=None)  # naive UTC for SQL Server DATETIME2
     t_total = time.perf_counter()
 
-    with engine.connect() as conn:
-        # ── 1. Get full machine list ──────────────────────────────────────────
-        print(f"[{_elapsed(t_total)}]  Fetching machine list for client='{client}'...")
+    if not test_connections(read_cfg, write_cfg):
+        sys.exit("Connection test failed — fix the errors above before running.")
+
+    read_engine = sa.create_engine(_make_db_url(read_cfg))
+    tbl         = _source_table(read_cfg)
+
+    # ── 1. Fetch machine list ─────────────────────────────────────────────────
+    area_desc = f"  area='{area}'" if area else ""
+    print(f"[{_elapsed(t_total)}]  Fetching machine list for client='{client}'{area_desc}...")
+    area_filter = "AND [Parent] = :area" if area else ""
+    params: dict = {"client": client}
+    if area:
+        params["area"] = area
+    with read_engine.connect() as conn:
         machine_rows = conn.execute(
-            sa.text(SQL_MACHINES.format(table=tbl, months=months)),
-            {"client": client},
+            sa.text(SQL_MACHINES.format(table=tbl, months=months, area_filter=area_filter)),
+            params,
         ).fetchall()
 
-    machine_guids = [r.machine_guid for r in machine_rows]
+    machine_guids  = [r.machine_guid for r in machine_rows]
+
+    # Pilot filters: single machine or hard cap
+    if machine_guid:
+        machine_guids = [g for g in machine_guids if g == machine_guid]
+        if not machine_guids:
+            sys.exit(f"Machine GUID '{machine_guid}' not found for client='{client}' "
+                     f"in the last {months} months.")
+    if limit_machines:
+        machine_guids = machine_guids[:limit_machines]
+
     total_machines = len(machine_guids)
-    batches = [
-        machine_guids[i: i + batch_size]
-        for i in range(0, total_machines, batch_size)
-    ]
-    n_batches = len(batches)
+    batches        = [machine_guids[i: i + batch_size]
+                      for i in range(0, total_machines, batch_size)]
+    n_batches      = len(batches)
     print(f"[{_elapsed(t_total)}]  {total_machines} machines → {n_batches} batch(es) of ≤{batch_size}\n")
 
     all_monthly: dict = defaultdict(list)
     all_meta:    dict = {}
-
-    # ── 2. Process in batches ─────────────────────────────────────────────────
     batch_times: list[float] = []
+
+    # ── 2. Batch queries ──────────────────────────────────────────────────────
     for i, batch in enumerate(batches, start=1):
-        t_batch = time.perf_counter()
-        guid_tuple = tuple(batch)
+        t_batch   = time.perf_counter()
+        guid_str  = _guid_list(batch)
 
-        with engine.connect() as conn:
-            monthly_rows = conn.execute(
-                sa.text(SQL_MONTHLY_BATCH.format(table=tbl, months=months)).bindparams(
-                    sa.bindparam("guids", expanding=True)
-                ),
-                {"client": client, "guids": list(guid_tuple)},
-            ).fetchall()
+        with read_engine.connect() as conn:
+            monthly_rows = conn.execute(sa.text(
+                SQL_MONTHLY_BATCH.format(table=tbl, months=months, guids=guid_str)
+            ), {"client": client}).fetchall()
 
-            meta_rows = conn.execute(
-                sa.text(SQL_META_BATCH.format(table=tbl)).bindparams(
-                    sa.bindparam("guids", expanding=True)
-                ),
-                {"client": client, "guids": list(guid_tuple)},
-            ).fetchall()
+            meta_rows = conn.execute(sa.text(
+                SQL_META_BATCH.format(table=tbl, guids=guid_str, months=months)
+            ), {"client": client}).fetchall()
 
         for row in monthly_rows:
             key = (row.machine_guid, row.point, row.parameter, row.type)
@@ -321,12 +554,12 @@ def run_db_mode(
             key = (row.machine_guid, row.point, row.parameter, row.type)
             all_meta[key] = {
                 "client":          row.client,
-                "area":            row.area,
+                "area":            row.area,       # sourced from [Parent]
                 "machine":         row.machine,
                 "component":       row.component,
                 "bearing":         row.bearing,
                 "unit":            row.unit,
-                "test_point_name": row.test_point_name,
+                "test_point_name": "",             # not in dbt table
                 "pal_plus":        row.pal_plus,
                 "al_plus":         row.al_plus,
                 "dg_plus":         row.dg_plus,
@@ -334,21 +567,101 @@ def run_db_mode(
 
         elapsed_batch = time.perf_counter() - t_batch
         batch_times.append(elapsed_batch)
-        avg_batch = sum(batch_times) / len(batch_times)
-        remaining = avg_batch * (n_batches - i)
-        pct = i / n_batches * 100
+        remaining = (sum(batch_times) / len(batch_times)) * (n_batches - i)
+        pct       = i / n_batches * 100
         print(
             f"[{_elapsed(t_total)}]  Batch {i:>{len(str(n_batches))}}/{n_batches} "
             f"({pct:5.1f}%)  {len(batch)} machines  "
             f"{elapsed_batch:.1f}s/batch  ETA {_fmt_seconds(remaining)}"
         )
 
-    # ── 3. Compute smart alarms ───────────────────────────────────────────────
+    # ── 3. Compute ────────────────────────────────────────────────────────────
     print(f"\n[{_elapsed(t_total)}]  Computing smart alarm thresholds...")
     results = compute_smart_alarms(all_monthly, all_meta, warning_mult, alarm_mult, run_ts)
 
+    # ── 4. Write back ─────────────────────────────────────────────────────────
+    if write_db:
+        write_engine = sa.create_engine(_make_db_url(write_cfg))
+        write_results_to_db(write_engine, write_cfg, results, t_total)
+    else:
+        print(f"[{_elapsed(t_total)}]  Skipping database write (--no-db-write).")
+
     print(f"[{_elapsed(t_total)}]  Done.  Total runtime: {_elapsed(t_total)}\n")
     return results
+
+
+WRITE_BATCH_SIZE = 500
+
+
+def _row_params(row: dict) -> dict:
+    return {
+        "client":              row.get("client") or "",
+        "machine_guid":        row.get("machine_guid") or "",
+        "point":               row.get("point") or "",
+        "parameter":           row.get("parameter") or "",
+        "type":                row.get("type") or "",
+        "area":                row.get("area"),
+        "machine":             row.get("machine"),
+        "component":           row.get("component"),
+        "bearing":             row.get("bearing"),
+        "unit":                row.get("unit"),
+        "test_point_name":     row.get("test_point_name"),
+        "iso_pre_alarm":       row.get("iso_pre_alarm"),
+        "iso_alarm":           row.get("iso_alarm"),
+        "iso_danger":          row.get("iso_danger"),
+        "baseline_avg":        row.get("baseline_avg"),
+        "smart_warning":       row.get("smart_warning"),
+        "smart_alarm":         row.get("smart_alarm"),
+        "stable":              1 if row.get("stable") else (0 if row.get("stable") is False else None),
+        "stability_note":      row.get("stability_note"),
+        "slope_per_month_pct": row.get("slope_per_month_pct"),
+        "trend_p_value":       row.get("trend_p_value"),
+        "months_of_data":      row.get("months_of_data"),
+        "total_readings":      row.get("total_readings"),
+        "computed_at":         row.get("computed_at"),
+    }
+
+
+def write_results_to_db(engine, write_cfg: dict, results: list[dict], t0: float) -> None:
+    """Creates the output table if needed, then merges results in batches."""
+    import sqlalchemy as sa
+
+    schema       = write_cfg["schema"]
+    output_table = write_cfg["output_table"]
+    total        = len(results)
+
+    print(f"[{_elapsed(t0)}]  Writing {total} rows to [{schema}].[{output_table}] "
+          f"in batches of {WRITE_BATCH_SIZE}...")
+
+    create_sql = SQL_CREATE_OUTPUT_TABLE.format(schema=schema, output_table=output_table)
+    merge_sql  = sa.text(SQL_MERGE.format(schema=schema, output_table=output_table))
+
+    # Create table once, outside the per-batch transactions
+    with engine.begin() as conn:
+        conn.execute(sa.text(create_sql))
+
+    batches     = [results[i: i + WRITE_BATCH_SIZE]
+                   for i in range(0, total, WRITE_BATCH_SIZE)]
+    n_batches   = len(batches)
+    batch_times: list[float] = []
+
+    for i, batch in enumerate(batches, start=1):
+        t_batch = time.perf_counter()
+        with engine.begin() as conn:
+            for row in batch:
+                conn.execute(merge_sql, _row_params(row))
+        elapsed_batch = time.perf_counter() - t_batch
+        batch_times.append(elapsed_batch)
+        remaining = (sum(batch_times) / len(batch_times)) * (n_batches - i)
+        pct       = i / n_batches * 100
+        rows_done = min(i * WRITE_BATCH_SIZE, total)
+        print(
+            f"[{_elapsed(t0)}]  Write batch {i:>{len(str(n_batches))}}/{n_batches} "
+            f"({pct:5.1f}%)  {rows_done}/{total} rows  "
+            f"{elapsed_batch:.1f}s/batch  ETA {_fmt_seconds(remaining)}"
+        )
+
+    print(f"[{_elapsed(t0)}]  Database write complete — {total} rows upserted.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,17 +683,15 @@ def run_demo_mode(
     alarm_mult: float,
     batch_size: int,
 ) -> list[dict]:
-    """Generates synthetic monthly history so every part of the algorithm runs."""
     print(f"Demo mode — building synthetic {months}-month history from {csv_path}")
     print(f"Client filter: '{client}'\n")
     random.seed(42)
     t_total = time.perf_counter()
-    run_ts  = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    run_ts  = datetime.now(tz=timezone.utc).replace(tzinfo=None)
 
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
 
-    # Apply client filter
     rows = [r for r in rows if r.get("client", "").strip() == client]
     if not rows:
         sys.exit(f"No rows found for client='{client}' in {csv_path}")
@@ -401,11 +712,10 @@ def run_demo_mode(
     stable_keys = set(keys[: int(n * 0.70)])
     rising_keys = set(keys[int(n * 0.70): int(n * 0.90)])
 
-    now = datetime.now(tz=timezone.utc)
-
-    # Batch the machine_guids just like the real DB path
+    now           = datetime.now(tz=timezone.utc)
     machine_guids = list({k[0] for k in snapshots})
-    batches       = [machine_guids[i: i + batch_size] for i in range(0, len(machine_guids), batch_size)]
+    batches       = [machine_guids[i: i + batch_size]
+                     for i in range(0, len(machine_guids), batch_size)]
     n_batches     = len(batches)
     print(f"  {len(machine_guids)} machines → {n_batches} batch(es) of ≤{batch_size}\n")
 
@@ -414,13 +724,12 @@ def run_demo_mode(
     batch_times: list[float] = []
 
     for b_idx, batch in enumerate(batches, start=1):
-        t_batch  = time.perf_counter()
+        t_batch   = time.perf_counter()
         batch_set = set(batch)
 
         for key, row in snapshots.items():
             if key[0] not in batch_set:
                 continue
-
             base_val = _parse_float(row["value"])
             if base_val is None or base_val <= 0:
                 continue
@@ -453,8 +762,7 @@ def run_demo_mode(
 
         elapsed_batch = time.perf_counter() - t_batch
         batch_times.append(elapsed_batch)
-        avg_b     = sum(batch_times) / len(batch_times)
-        remaining = avg_b * (n_batches - b_idx)
+        remaining = (sum(batch_times) / len(batch_times)) * (n_batches - b_idx)
         pct       = b_idx / n_batches * 100
         print(
             f"[{_elapsed(t_total)}]  Batch {b_idx:>{len(str(n_batches))}}/{n_batches} "
@@ -472,8 +780,6 @@ def run_demo_mode(
 #  TIMING HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-_T0: float = 0.0
-
 def _elapsed(t0: float) -> str:
     s = time.perf_counter() - t0
     return f"{int(s // 60):02d}:{s % 60:05.2f}"
@@ -489,14 +795,10 @@ def _fmt_seconds(s: float) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 OUTPUT_FIELDS = [
-    # metadata
     "client", "area", "machine_guid", "machine", "component", "bearing",
     "point", "parameter", "type", "unit", "test_point_name",
-    # existing ISO alarms
     "iso_pre_alarm", "iso_alarm", "iso_danger",
-    # smart alarm outputs
     "baseline_avg", "smart_warning", "smart_alarm",
-    # stability audit
     "stable", "stability_note", "slope_per_month_pct", "trend_p_value",
     "months_of_data", "total_readings", "computed_at",
 ]
@@ -506,11 +808,16 @@ def write_csv(results: list[dict], path: str) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(results)
+        for row in results:
+            # Format datetime as string for CSV; DB writes use the native object
+            out = dict(row)
+            if isinstance(out.get("computed_at"), datetime):
+                out["computed_at"] = out["computed_at"].strftime("%Y-%m-%d %H:%M:%S UTC")
+            writer.writerow(out)
 
 
 def print_summary(results: list[dict]) -> None:
-    total        = len(results)
+    total = len(results)
     if total == 0:
         print("No results.")
         return
@@ -521,33 +828,28 @@ def print_summary(results: list[dict]) -> None:
     print(f"{'='*65}")
     print(f"  Smart Alarm Summary")
     print(f"{'='*65}")
-    print(f"  Total measurement points  : {total}")
-    print(f"  Smart alarms computed     : {has_smart}  ({has_smart/total*100:.0f}%)")
-    print(f"  Unstable — ISO kept active: {unstable}")
+    print(f"  Total measurement points   : {total}")
+    print(f"  Smart alarms computed      : {has_smart}  ({has_smart/total*100:.0f}%)")
+    print(f"  Unstable — ISO kept active : {unstable}")
     print(f"  Insufficient data (skipped): {insufficient}")
     print(f"{'='*65}\n")
 
-    sample = [r for r in results if r["smart_warning"] is not None][:6]
-    if sample:
-        print("  Sample — stable points:")
-        for r in sample:
-            iso_a = r["iso_alarm"] if r["iso_alarm"] is not None else "N/A"
-            print(
-                f"    {str(r['point']):12s}  {str(r['parameter']):26s}"
-                f"  avg={r['baseline_avg']:.4f} {str(r['unit']):5s}"
-                f"  smart_warn={r['smart_warning']:.4f}"
-                f"  smart_alarm={r['smart_alarm']:.4f}"
-                f"  (ISO alert={iso_a})"
-            )
+    for r in [r for r in results if r["smart_warning"] is not None][:6]:
+        iso_a = r["iso_alarm"] if r["iso_alarm"] is not None else "N/A"
+        print(
+            f"  {str(r['point']):12s}  {str(r['parameter']):26s}"
+            f"  avg={r['baseline_avg']:.4f} {str(r['unit']):5s}"
+            f"  warn={r['smart_warning']:.4f}  alarm={r['smart_alarm']:.4f}"
+            f"  (ISO={iso_a})"
+        )
 
     bad = [r for r in results if r["stable"] is False][:3]
     if bad:
-        print("\n  Sample — unstable points (ISO alarms remain active):")
+        print("\n  Unstable (ISO alarms remain active):")
         for r in bad:
             print(
-                f"    {str(r['point']):12s}  {str(r['parameter']):26s}"
-                f"  slope={r['slope_per_month_pct']:+.1f}%/mo"
-                f"  p={r['trend_p_value']:.3f}"
+                f"  {str(r['point']):12s}  {str(r['parameter']):26s}"
+                f"  slope={r['slope_per_month_pct']:+.1f}%/mo  p={r['trend_p_value']:.3f}"
             )
     print()
 
@@ -558,26 +860,40 @@ def print_summary(results: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute smart vibration alarm thresholds",
+        description="Compute smart vibration alarm thresholds (SQL Server)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--demo",       action="store_true",
-                        help="Demo mode: use sample CSV with synthetic history")
-    parser.add_argument("--csv",        default="falcon_scalars_example_data_1000_rows.csv",
+    parser.add_argument("--test",         action="store_true",
+                        help="Test DB connections then exit")
+    parser.add_argument("--show-columns", action="store_true",
+                        help="Print all column names in the source table then exit")
+    parser.add_argument("--demo",        action="store_true",
+                        help="Demo mode: sample CSV with synthetic history, no DB needed")
+    parser.add_argument("--csv",         default="falcon_scalars_example_data_1000_rows.csv",
                         help="Sample CSV path (demo mode only)")
-    parser.add_argument("--client",     default=DEFAULT_CLIENT,
-                        help="Client name to filter on")
-    parser.add_argument("--months",     type=int,   default=DEFAULT_MONTHS,
-                        help="Lookback window in months")
-    parser.add_argument("--warning",    type=float, default=DEFAULT_WARNING_MULT,
-                        help="Warning threshold multiplier")
-    parser.add_argument("--alarm",      type=float, default=DEFAULT_ALARM_MULT,
-                        help="Alarm threshold multiplier")
-    parser.add_argument("--batch-size", type=int,   default=DEFAULT_BATCH_SIZE,
-                        help="Machines per database query batch")
-    parser.add_argument("--out",        default="smart_alarm_results.csv",
-                        help="Output CSV path")
+    parser.add_argument("--client",      default=DEFAULT_CLIENT)
+    parser.add_argument("--months",      type=int,   default=DEFAULT_MONTHS)
+    parser.add_argument("--warning",     type=float, default=DEFAULT_WARNING_MULT)
+    parser.add_argument("--alarm",       type=float, default=DEFAULT_ALARM_MULT)
+    parser.add_argument("--batch-size",  type=int,   default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--out",         default="smart_alarm_results.csv")
+    parser.add_argument("--no-db-write", action="store_true",
+                        help="Skip writing to the database (CSV output only)")
+    parser.add_argument("--machine",     default=None,
+                        help="Run for a single machine GUID only (pilot mode)")
+    parser.add_argument("--limit",       type=int, default=None,
+                        help="Cap the number of machines processed (e.g. --limit 1)")
+    parser.add_argument("--area",        default=None,
+                        help="Filter by Parent area (e.g. 'Calpan/Building 12/Level 2/Step 34')")
     args = parser.parse_args()
+
+    if args.test:
+        ok = test_connections(READ_CONFIG, WRITE_CONFIG)
+        sys.exit(0 if ok else 1)
+
+    if args.show_columns:
+        show_columns(READ_CONFIG)
+        sys.exit(0)
 
     if args.demo:
         results = run_demo_mode(
@@ -585,9 +901,15 @@ def main():
             args.warning, args.alarm, args.batch_size,
         )
     else:
+        if not READ_CONFIG["host"]:
+            sys.exit("READ_DB_HOST is not set. Copy .env.example to .env and fill in your details.")
         results = run_db_mode(
-            DB_CONFIG, args.client, args.months,
+            READ_CONFIG, WRITE_CONFIG, args.client, args.months,
             args.warning, args.alarm, args.batch_size,
+            write_db=not args.no_db_write,
+            machine_guid=args.machine,
+            limit_machines=args.limit,
+            area=args.area,
         )
 
     print_summary(results)

@@ -56,7 +56,7 @@ READ_CONFIG = {
     "dbname":   os.environ.get("READ_DB_NAME", ""),
     "user":     os.environ.get("READ_DB_USER", ""),
     "password": os.environ.get("READ_DB_PASSWORD", ""),
-    "schema":   os.environ.get("DB_SCHEMA", "dbo"),
+    "schema":   os.environ.get("DB_SCHEMA2", "arsl_mart"),
     "table":    os.environ.get("READ_DB_TABLE", "falcon_scalars"),
 }
 
@@ -222,63 +222,63 @@ def _guid_list(guids: list[str]) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 SQL_MACHINES = """
-SELECT DISTINCT [Machine GUID] AS machine_guid, [Machine] AS machine
+SELECT DISTINCT [machine_guid] AS machine_guid, [machine] AS machine
 FROM {table}
 WHERE [client] = :client
-  AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+  AND [date_meas] >= DATEADD(month, -{months}, GETUTCDATE())
   {area_filter}
-ORDER BY [Machine GUID]
+ORDER BY [machine_guid]
 """
 
 SQL_MONTHLY_BATCH = """
 SELECT
-    [Machine GUID]  AS machine_guid,
-    [Point]         AS point,
-    [Parameter]     AS parameter,
-    [Type]          AS type,
-    FORMAT(DATEADD(month, DATEDIFF(month, 0, [Date(meas)]), 0), 'yyyy-MM') AS month,
-    AVG([Value])    AS avg_value,
+    [machine_guid]  AS machine_guid,
+    [point]         AS point,
+    [parameter]     AS parameter,
+    [type]          AS type,
+    FORMAT(DATEADD(month, DATEDIFF(month, 0, [date_meas]), 0), 'yyyy-MM') AS month,
+    AVG([value])    AS avg_value,
     COUNT(*)        AS reading_count
 FROM {table}
 WHERE
     [client] = :client
-    AND [Machine GUID] IN ({guids})
-    AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
-    AND [Date(meas)] <  GETUTCDATE()
-    AND [Status code] IN (2, 3, 4, 5)
-    AND [Value] IS NOT NULL
-    AND [Value] > 0
+    AND [machine_guid] IN ({guids})
+    AND [date_meas] >= DATEADD(month, -{months}, GETUTCDATE())
+    AND [date_meas] <  GETUTCDATE()
+    AND [status_code] IN (2, 3, 4, 5)
+    AND [value] IS NOT NULL
+    AND [value] > 0
 GROUP BY
-    [Machine GUID], [Point], [Parameter], [Type],
-    DATEADD(month, DATEDIFF(month, 0, [Date(meas)]), 0)
-ORDER BY [Machine GUID], [Point], [Parameter], [Type], month
+    [machine_guid], [point], [parameter], [type],
+    DATEADD(month, DATEDIFF(month, 0, [date_meas]), 0)
+ORDER BY [machine_guid], [point], [parameter], [type], month
 """
 
 SQL_META_BATCH = """
 WITH ranked AS (
     SELECT
-        [Machine GUID]  AS machine_guid,
-        [Point]         AS point,
-        [Parameter]     AS parameter,
-        [Type]          AS type,
+        [machine_guid]  AS machine_guid,
+        [point]         AS point,
+        [parameter]     AS parameter,
+        [type]          AS type,
         [Unit]          AS unit,
         [client]        AS client,
-        [Machine]       AS machine,
-        [Component]     AS component,
-        [Bearing]       AS bearing,
-        [Parent]        AS area,
-        [pAL+]          AS pal_plus,
-        [AL+]           AS al_plus,
-        [DG+]           AS dg_plus,
+        [machine]       AS machine,
+        [component]     AS component,
+        [bearing]       AS bearing,
+        [parent]        AS area,
+        [pal_plus]          AS pal_plus,
+        [al_plus]           AS al_plus,
+        [dg_plus]           AS dg_plus,
         ROW_NUMBER() OVER (
-            PARTITION BY [Machine GUID], [Point], [Parameter], [Type]
-            ORDER BY [Date(meas)] DESC
+            PARTITION BY [machine_guid], [point], [parameter], [type]
+            ORDER BY [date_meas] DESC
         ) AS rn
     FROM {table}
     WHERE
         [client] = :client
-        AND [Machine GUID] IN ({guids})
-        AND [Date(meas)] >= DATEADD(month, -{months}, GETUTCDATE())
+        AND [machine_guid] IN ({guids})
+        AND [date_meas] >= DATEADD(month, -{months}, GETUTCDATE())
 )
 SELECT * FROM ranked WHERE rn = 1
 """

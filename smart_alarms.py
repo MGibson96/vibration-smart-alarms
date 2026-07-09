@@ -37,6 +37,9 @@ import os
 import random
 import sys
 import time
+import math
+import numpy as np
+import pandas as pd
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -111,6 +114,7 @@ def is_stable(monthly_values: list[float]) -> tuple[bool, float | None, float | 
 
     trending_up = (p_value < P_VALUE_ALPHA) and (slope_norm > SLOPE_THRESHOLD)
     return not trending_up, round(slope_norm, 5), round(p_value, 5)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -593,34 +597,46 @@ def run_db_mode(
 WRITE_BATCH_SIZE = 500
 
 
-def _row_params(row: dict) -> dict:
-    return {
-        "client":              row.get("client") or "",
-        "machine_guid":        row.get("machine_guid") or "",
-        "point":               row.get("point") or "",
-        "parameter":           row.get("parameter") or "",
-        "type":                row.get("type") or "",
-        "area":                row.get("area"),
-        "machine":             row.get("machine"),
-        "component":           row.get("component"),
-        "bearing":             row.get("bearing"),
-        "unit":                row.get("unit"),
-        "test_point_name":     row.get("test_point_name"),
-        "iso_pre_alarm":       row.get("iso_pre_alarm"),
-        "iso_alarm":           row.get("iso_alarm"),
-        "iso_danger":          row.get("iso_danger"),
-        "baseline_avg":        row.get("baseline_avg"),
-        "smart_warning":       row.get("smart_warning"),
-        "smart_alarm":         row.get("smart_alarm"),
-        "stable":              1 if row.get("stable") else (0 if row.get("stable") is False else None),
-        "stability_note":      row.get("stability_note"),
-        "slope_per_month_pct": row.get("slope_per_month_pct"),
-        "trend_p_value":       row.get("trend_p_value"),
-        "months_of_data":      row.get("months_of_data"),
-        "total_readings":      row.get("total_readings"),
-        "computed_at":         row.get("computed_at"),
-    }
+def _db_value(value):
+    try:
+        import pandas as pd
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
 
+    return value
+
+
+def _row_params(row: dict) -> dict:
+    stable = row.get("stable")
+
+    return {
+        "client":              _db_value(row.get("client")) or "",
+        "machine_guid":        _db_value(row.get("machine_guid")) or "",
+        "point":               _db_value(row.get("point")) or "",
+        "parameter":           _db_value(row.get("parameter")) or "",
+        "type":                _db_value(row.get("type")) or "",
+        "area":                _db_value(row.get("area")),
+        "machine":             _db_value(row.get("machine")),
+        "component":           _db_value(row.get("component")),
+        "bearing":             _db_value(row.get("bearing")),
+        "unit":                _db_value(row.get("unit")),
+        "test_point_name":     _db_value(row.get("test_point_name")),
+        "iso_pre_alarm":       _db_value(row.get("iso_pre_alarm")),
+        "iso_alarm":           _db_value(row.get("iso_alarm")),
+        "iso_danger":          _db_value(row.get("iso_danger")),
+        "baseline_avg":        _db_value(row.get("baseline_avg")),
+        "smart_warning":       _db_value(row.get("smart_warning")),
+        "smart_alarm":         _db_value(row.get("smart_alarm")),
+        "stable":              1 if stable else (0 if stable is False else None),
+        "stability_note":      _db_value(row.get("stability_note")),
+        "slope_per_month_pct": _db_value(row.get("slope_per_month_pct")),
+        "trend_p_value":       _db_value(row.get("trend_p_value")),
+        "months_of_data":      _db_value(row.get("months_of_data")),
+        "total_readings":      _db_value(row.get("total_readings")),
+        "computed_at":         _db_value(row.get("computed_at")),
+    }
 
 def write_results_to_db(engine, write_cfg: dict, results: list[dict], t0: float) -> None:
     """Creates the output table if needed, then merges results in batches."""

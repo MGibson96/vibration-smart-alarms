@@ -88,6 +88,7 @@ SLOPE_THRESHOLD      = 0.05   # normalised slope > 5 %/month → unstable
 P_VALUE_ALPHA        = 0.10
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  STABILITY CHECK
 # ─────────────────────────────────────────────────────────────────────────────
@@ -180,9 +181,29 @@ def compute_smart_alarms(
         row["trend_p_value"]        = p_val
 
         if stable:
-            row["smart_warning"]  = round(baseline_avg * warning_mult, 4)
-            row["smart_alarm"]    = round(baseline_avg * alarm_mult, 4)
-            row["stability_note"] = "Stable baseline"
+            raw_warning = baseline_avg * warning_mult
+            raw_alarm = baseline_avg * alarm_mult
+
+            # Use the existing ISO values as minimum allowed smart values
+            minimum_warning = row["iso_alarm"]
+            minimum_alarm = row["iso_danger"]
+
+            final_warning = raw_warning
+            final_alarm = raw_alarm
+
+            if minimum_warning is not None:
+                final_warning = max(raw_warning, float(minimum_warning))
+
+            if minimum_alarm is not None:
+                final_alarm = max(raw_alarm, float(minimum_alarm))
+
+            row["smart_warning"] = round(final_warning, 4)
+            row["smart_alarm"] = round(final_alarm, 4)
+
+            if final_warning > raw_warning or final_alarm > raw_alarm:
+                row["stability_note"] = "Stable baseline — minimum applied"
+            else:
+                row["stability_note"] = "Stable baseline"
         else:
             direction = "increasing" if (slope_norm or 0) > 0 else "decreasing"
             row["stability_note"] = (
